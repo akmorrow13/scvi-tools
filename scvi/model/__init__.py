@@ -3,6 +3,10 @@ from ._linear_scvi import LinearSCVI
 from ._peakvi import PEAKVI
 from ._scanvi import SCANVI
 from ._scvi import SCVI
+from ._tfvi import TFVI
+from ._scpeakvi import SCPEAKVI
+from ._scpeakvitwo import SCPEAKVITWO
+from ._scpeakvithree import SCPEAKVITHREE
 from ._totalvi import TOTALVI
 
 __all__ = [
@@ -12,4 +16,10 @@ __all__ = [
     "AUTOZI",
     "SCANVI",
     "PEAKVI",
+    "TFVI",
+    "SCPEAKVI",
+    "SCPEAKVITWO",
+    "SCPEAKVITHREE",
+    "CondSCVI",
+    "DestVI",
 ]
