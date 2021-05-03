@@ -7,6 +7,8 @@ from ._scanvi import SCANVI
 from ._scvi import SCVI
 from ._tfvi import TFVI
 from ._scpeakvi import SCPEAKVI
+from ._scpeakvitwo import SCPEAKVITWO
+from ._scpeakvithree import SCPEAKVITHREE
 from ._totalvi import TOTALVI
 
 __all__ = [
@@ -18,6 +20,8 @@ __all__ = [
     "PEAKVI",
     "TFVI",
     "SCPEAKVI",
+    "SCPEAKVITWO",
+    "SCPEAKVITHREE",
     "CondSCVI",
     "DestVI",
 ]

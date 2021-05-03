@@ -1,4 +1,5 @@
 from typing import Dict, Iterable, Optional
+from scipy.sparse import coo_matrix
 
 import numpy as np
 import torch
@@ -10,7 +11,10 @@ from scvi.module.base import BaseModuleClass, LossRecorder, auto_move_data
 from scvi.nn import Encoder, FCLayers, DecoderSCVI
 from scvi.distributions import NegativeBinomial, ZeroInflatedNegativeBinomial
 
+from torch import nn as nn
 
+
+# CascadeDecoder
 class Decoder(torch.nn.Module):
     """
     Decodes data from latent space of ``n_input`` dimensions ``n_output``dimensions.
@@ -75,7 +79,144 @@ class Decoder(torch.nn.Module):
         return x
 
 
-class SCPEAKVAE(BaseModuleClass):
+class Attention(nn.Module):
+    def __init__(self, dimensions, attention_type='general'):
+        super(Attention, self).__init__()
+
+        if attention_type not in ['dot', 'general']:
+            raise ValueError('Invalid attention type selected.')
+
+        self.attention_type = attention_type
+        if self.attention_type == 'general':
+            self.linear_in = nn.Linear(dimensions, dimensions, bias=False)
+
+        self.linear_out = nn.Linear(dimensions * 2, dimensions, bias=False)
+        self.softmax = nn.Softmax(dim=-1)
+        self.tanh = nn.Tanh()
+
+    def forward(self, query, context):
+        batch_size, output_len, dimensions = query.size()
+        query_len = context.size(1)
+
+        if self.attention_type == "general":
+            query = query.reshape(batch_size * output_len, dimensions)
+            query = self.linear_in(query)
+            query = query.reshape(batch_size, output_len, dimensions)
+
+        # (batch_size, output_len, dimensions) * (batch_size, query_len, dimensions) ->
+        # (batch_size, output_len, query_len)
+        attention_scores = torch.bmm(query, context.transpose(1, 2).contiguous())
+
+        # Compute weights across every context sequence
+        attention_scores = attention_scores.view(batch_size * output_len, query_len)
+        attention_weights = self.softmax(attention_scores)
+        attention_weights = attention_weights.view(batch_size, output_len, query_len)
+
+        # (batch_size, output_len, query_len) * (batch_size, query_len, dimensions) ->
+        # (batch_size, output_len, dimensions)
+        mix = torch.bmm(attention_weights, context)
+
+        # concat -> (batch_size * output_len, 2*dimensions)
+        combined = torch.cat((mix, query), dim=2)
+        combined = combined.view(batch_size * output_len, 2 * dimensions)
+
+        # Apply linear_out on every 2nd dimension of concat
+        # output -> (batch_size, output_len, dimensions)
+        output = self.linear_out(combined).view(batch_size, output_len, dimensions)
+        output = self.tanh(output)
+
+        return output, attention_weights
+
+
+class LocalLinear(nn.Module):
+    def __init__(self,in_features,local_features,kernel_size,padding=0,stride=1,bias=True):
+        super(LocalLinear, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+
+        fold_num = (in_features+2*padding-self.kernel_size)//self.stride+1
+        self.weight = nn.Parameter(torch.randn(fold_num,kernel_size,local_features))
+        self.bias = nn.Parameter(torch.randn(fold_num,local_features)) if bias else None
+
+    def forward(self, x:torch.Tensor):
+        x = F.pad(x,[self.padding]*2,value=0)
+        x = x.unfold(-1,size=self.kernel_size,step=self.stride)
+        x = torch.matmul(x.unsqueeze(2),self.weight).squeeze(2)+self.bias
+        return x
+
+
+class SparseLocalLinear(nn.Module):
+    def __init__(self, mat:coo_matrix):
+        super(SparseLocalLinear, self).__init__()
+        shape = mat.shape
+        self.in_dim = shape[0]
+        self.out_dim = shape[1]
+
+        values = mat.data
+        indices = np.vstack((mat.row, mat.col))
+        i = torch.LongTensor(indices)
+        v = torch.FloatTensor(values)
+
+        self.param = nn.Parameter(torch.sparse.FloatTensor(i, v, torch.Size(shape), requires_grad=True))
+        # coo = coo_matrix(([3, 4, 5], ([0, 1, 1], [2, 0, 2])), shape=(2, 3))
+
+    def forward(self, x: torch.Tensor):
+        return torch.sparse.mm(self.weights, x)
+
+
+class DecoderCA(nn.Module):
+
+    def __init__(
+        self,
+        n_input: int,
+        n_output: int,
+        n_cat_list: Iterable[int] = None,
+        n_layers: int = 1,
+        n_hidden: int = 128,
+        inject_covariates: bool = True,
+        use_batch_norm: bool = False,
+        use_layer_norm: bool = False,
+        mask: coo_matrix=None,
+    ):
+        super().__init__()
+        self.px_decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=0,
+            inject_covariates=inject_covariates,
+            use_batch_norm=use_batch_norm,
+            use_layer_norm=use_layer_norm,
+        )
+
+        # mean gamma
+        self.px_scale_decoder = nn.Sequential(SparseLocalLinear(mat=mask),
+                                              nn.Softmax(dim=-1),)
+
+        # dispersion: here we only deal with gene-cell dispersion case
+        self.px_r_decoder = SparseLocalLinear(mat=mask)
+
+        # dropout
+        self.px_dropout_decoder = SparseLocalLinear(mat=mask)
+
+    def forward(
+        self, dispersion: str, z: torch.Tensor, library: torch.Tensor, *cat_list: int
+    ):
+        # The decoder returns values for the parameters of the ZINB distribution
+        # px = self.px_decoder(z, *cat_list)
+        px = z
+        px_scale = self.px_scale_decoder(px)
+        px_dropout = self.px_dropout_decoder(px)
+        # Clamp to high value: exp(12) ~ 160000 to avoid nans (computational stability)
+        px_rate = torch.exp(library) * px_scale  # torch.clamp( , max=12)
+        px_r = self.px_r_decoder(px) if dispersion == "gene-cell" else None
+        return px_scale, px_r, px_rate, px_dropout
+
+
+class SCPEAKVAETWO(BaseModuleClass):
     """
     Variational auto-encoder model for ATAC-seq data.
 
@@ -154,6 +295,7 @@ class SCPEAKVAE(BaseModuleClass):
         gene_likelihood: str = "zinb",
         log_variational: bool = True,
         use_observed_lib_size: bool = True,
+        mask: coo_matrix = None,
     ):
         super().__init__()
 
@@ -216,17 +358,22 @@ class SCPEAKVAE(BaseModuleClass):
                                  activation_fn=torch.nn.LeakyReLU, distribution=self.latent_distribution, var_eps=0,
                                  use_batch_norm=self.use_batch_norm_encoder, use_layer_norm=self.use_layer_norm_encoder)
 
-        # SCVI DECODER
-        n_input_decoder = n_latent + n_continuous_cov
-        self.decoder = DecoderSCVI(n_input_decoder, n_input, n_cat_list=cat_list, n_layers=n_layers_decoder,
-                                   n_hidden=self.n_hidden, inject_covariates=deeply_inject_covariates,
-                                   use_batch_norm=use_batch_norm_decoder, use_layer_norm=use_layer_norm_decoder,)
-
         # PEAKVI DECODER
         self.z_decoder = Decoder(n_input=self.n_latent + self.n_continuous_cov, n_output=n_input_regions,
                                  n_hidden=self.n_hidden, n_cat_list=cat_list, n_layers=self.n_layers_decoder,
                                  use_batch_norm=self.use_batch_norm_decoder, use_layer_norm=self.use_layer_norm_decoder,
                                  deep_inject_covariates=self.deeply_inject_covariates,)
+
+        # SCVI DECODER - Here we have to cascade the decoder.
+        #self.decoder = DecoderCascade(n_input_regions, n_input, n_cat_list=cat_list, n_layers=n_layers_decoder,
+        #                           n_hidden=self.n_hidden, inject_covariates=deeply_inject_covariates,
+        #                           use_batch_norm=use_batch_norm_decoder, use_layer_norm=use_layer_norm_decoder,)
+
+        n_input_decoder = n_input_regions
+        self.decoder = DecoderCA(n_input_decoder, n_input, n_cat_list=cat_list, n_layers=n_layers_decoder,
+                                 n_hidden=self.n_hidden, inject_covariates=deeply_inject_covariates,
+                                 use_batch_norm=use_batch_norm_decoder, use_layer_norm=use_layer_norm_decoder,
+                                 mask=mask)
 
         # PEAK VI ADDITIONAL ENCODERS
         self.d_encoder = None
@@ -343,8 +490,9 @@ class SCPEAKVAE(BaseModuleClass):
         decoder_input = (latent if cont_covs is None else torch.cat([latent, cont_covs], dim=-1))
         p = self.z_decoder(decoder_input, batch_index, *categorical_input)
 
-        # DECODER SCVI
-        decoder_input = z if cont_covs is None else torch.cat([z, cont_covs], dim=-1)
+        # DECODER SCVI - In this case, we cascade the networks.
+        # decoder_input = z if cont_covs is None else torch.cat([z, cont_covs], dim=-1)
+        decoder_input = p
         px_scale, px_r, px_rate, px_dropout = self.decoder(self.dispersion, decoder_input, library, batch_index,
                                                            *categorical_input, y)
         if self.dispersion == "gene-label":

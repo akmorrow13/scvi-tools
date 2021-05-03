@@ -75,7 +75,7 @@ class Decoder(torch.nn.Module):
         return x
 
 
-class SCPEAKVAE(BaseModuleClass):
+class SCPEAKVAETHREE(BaseModuleClass):
     """
     Variational auto-encoder model for ATAC-seq data.
 
@@ -208,10 +208,16 @@ class SCPEAKVAE(BaseModuleClass):
         use_layer_norm_decoder = use_layer_norm == "decoder" or use_layer_norm == "both"
 
         # MODIFICATION ENCODER ENCODES ENTIRE VECTOR OF GENES + REGIONS
-        n_input_encoder = self.n_input + self.n_input_regions + n_continuous_cov * encode_covariates
+        n_input_encoderA = self.n_input_regions + n_continuous_cov * encode_covariates
+        n_input_encoderR = self.n_input + n_continuous_cov * encode_covariates
         encoder_cat_list = cat_list if encode_covariates else None
 
-        self.z_encoder = Encoder(n_input=n_input_encoder, n_layers=self.n_layers_encoder, n_output=self.n_latent,
+        self.z_encoderA = Encoder(n_input=n_input_encoderA, n_layers=self.n_layers_encoder, n_output=self.n_latent,
+                                 n_hidden=self.n_hidden, n_cat_list=encoder_cat_list, dropout_rate=self.dropout_rate,
+                                 activation_fn=torch.nn.LeakyReLU, distribution=self.latent_distribution, var_eps=0,
+                                 use_batch_norm=self.use_batch_norm_encoder, use_layer_norm=self.use_layer_norm_encoder)
+
+        self.z_encoderR = Encoder(n_input=n_input_encoderR, n_layers=self.n_layers_encoder, n_output=self.n_latent,
                                  n_hidden=self.n_hidden, n_cat_list=encoder_cat_list, dropout_rate=self.dropout_rate,
                                  activation_fn=torch.nn.LeakyReLU, distribution=self.latent_distribution, var_eps=0,
                                  use_batch_norm=self.use_batch_norm_encoder, use_layer_norm=self.use_layer_norm_encoder)
@@ -240,7 +246,8 @@ class SCPEAKVAE(BaseModuleClass):
 
         # SCVI ADDITIONAL ENCODERS
         # l encoder goes from n_input-dimensional data to 1-d library size
-        self.l_encoder = Encoder(n_input_encoder - n_input_regions, 1, n_layers=1, n_cat_list=encoder_cat_list,
+        n_input_encoder = self.n_input + n_continuous_cov * encode_covariates
+        self.l_encoder = Encoder(n_input_encoder, 1, n_layers=1, n_cat_list=encoder_cat_list,
                                  n_hidden=self.n_hidden, dropout_rate=dropout_rate,
                                  inject_covariates=deeply_inject_covariates,
                                  use_batch_norm=use_batch_norm_encoder, use_layer_norm=use_layer_norm_encoder, )
@@ -269,7 +276,6 @@ class SCPEAKVAE(BaseModuleClass):
             encoder_rna = torch.cat((x_rna, cont_covs), dim=-1)
             encoder_chr = torch.cat((x_chr, cont_covs), dim=-1)
         else:
-            encoder_input = x
             encoder_rna = x_rna
             encoder_chr = x_chr
 
@@ -279,7 +285,9 @@ class SCPEAKVAE(BaseModuleClass):
             categorical_input = tuple()
 
         # Z Encoders
-        qz_m, qz_v, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
+        qza_m, qza_v, za = self.z_encoderA(encoder_chr, batch_index, *categorical_input)
+        qzr_m, qzr_v, zr = self.z_encoderR(encoder_rna, batch_index, *categorical_input)
+
         #   d Encoder PeakVI
         d = (self.d_encoder(encoder_chr, batch_index, *categorical_input) if self.model_depth else 1)
         #   l Encoder SCVI
@@ -290,25 +298,33 @@ class SCPEAKVAE(BaseModuleClass):
 
         # ReFormat Outputs
         if n_samples > 1:
-            qz_m = qz_m.unsqueeze(0).expand((n_samples, qz_m.size(0), qz_m.size(1)))
-            qz_v = qz_v.unsqueeze(0).expand((n_samples, qz_v.size(0), qz_v.size(1)))
+            qza_m = qza_m.unsqueeze(0).expand((n_samples, qza_m.size(0), qza_m.size(1)))
+            qza_v = qza_v.unsqueeze(0).expand((n_samples, qza_v.size(0), qza_v.size(1)))
+            untran_za = Normal(qza_m, qza_v.sqrt()).sample()
+            za = self.z_encoderA.z_transformation(untran_za)
 
-            untran_z = Normal(qz_m, qz_v.sqrt()).sample()
-            z = self.z_encoder.z_transformation(untran_z)
+            qzr_m = qzr_m.unsqueeze(0).expand((n_samples, qzr_m.size(0), qzr_m.size(1)))
+            qzr_v = qzr_v.unsqueeze(0).expand((n_samples, qzr_v.size(0), qzr_v.size(1)))
+            untran_zr = Normal(qzr_m, qzr_v.sqrt()).sample()
+            zr = self.z_encoderR.z_transformation(untran_zr)
 
             ql_m = ql_m.unsqueeze(0).expand((n_samples, ql_m.size(0), ql_m.size(1)))
             ql_v = ql_v.unsqueeze(0).expand((n_samples, ql_v.size(0), ql_v.size(1)))
             if self.use_observed_lib_size:
-                library = library.unsqueeze(0).expand(
-                    (n_samples, library.size(0), library.size(1))
-                )
+                library = library.unsqueeze(0).expand((n_samples, library.size(0), library.size(1)))
             else:
                 library = Normal(ql_m, ql_v.sqrt()).sample()
 
-        outputs = dict(z=z, qz_m=qz_m, qz_v=qz_v, ql_m=ql_m, ql_v=ql_v, d=d, library=library)
+        z = torch.mean(torch.stack([za, zr]), dim=0)
+        qz_m = torch.mean(torch.stack([qza_m, qzr_m]), dim=0)
+        qz_v = torch.div(torch.mean(torch.stack([qza_v, qzr_v]), dim=0), 2)     # Are this variables uncorrelated?
+
+        outputs = dict(z=z, za=za,  qz_m=qz_m, qz_v=qz_v, zr=zr, qzr_m=qzr_m, qzr_v=qzr_v, qza_m=qza_m, qza_v=qza_v,
+                       ql_m=ql_m, ql_v=ql_v, d=d, library=library)
         return outputs
 
     def _get_generative_input(self, tensors, inference_outputs, transform_batch=None):
+
         z = inference_outputs["z"]
         qz_m = inference_outputs["qz_m"]
         library = inference_outputs["library"]
@@ -380,6 +396,8 @@ class SCPEAKVAE(BaseModuleClass):
     def loss(self, tensors, inference_outputs, generative_outputs, kl_weight: float = 1.0):
         # GET DATA
         x = tensors[_CONSTANTS.X_KEY]
+        za = inference_outputs["za"]
+        zr = inference_outputs["zr"]
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
         d = inference_outputs["d"]
@@ -400,14 +418,20 @@ class SCPEAKVAE(BaseModuleClass):
         else:
             kl_div_l = 0.0
 
+        # RECONSTRUCTION LOSS
         f = torch.sigmoid(self.region_factors) if self.region_factors is not None else 1
         reconst_loss = self.get_reconstruction_loss(p, d, f, x, px_rate, px_r, px_dropout)
 
+        # KL WARMUP
         kl_local_for_warmup = kl_div_z
         kl_local_no_warmup = kl_div_l
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
 
-        loss = torch.mean(reconst_loss + weighted_kl_local)  # LOSS SCVI
+        # PENALTY
+        distance_penalty = kl_weight * torch.pow(za - zr, 2).sum(dim=1)
+
+        # TOTAL LOSS
+        loss = torch.mean(reconst_loss + weighted_kl_local + distance_penalty)
 
         kl_local = dict(kl_divergence_l=kl_div_l, kl_divergence_z=kl_div_z)
         kl_global = 0.0

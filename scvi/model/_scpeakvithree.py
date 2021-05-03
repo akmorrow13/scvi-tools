@@ -17,7 +17,7 @@ from scvi.model._utils import (
     scatac_raw_counts_properties,
 )
 from scvi.model.base import UnsupervisedTrainingMixin
-from scvi.module import TFVAE
+from scvi.module import SCPEAKVAETHREE
 from scvi.train._callbacks import SaveBestState
 
 from .base import ArchesMixin, BaseModelClass, VAEMixin
@@ -26,9 +26,9 @@ from .base._utils import _de_core
 logger = logging.getLogger(__name__)
 
 
-class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
+class SCPEAKVITHREE(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     """
-    TFVI.
+    SCVI - PeakVI.
 
     Parameters
     ----------
@@ -72,9 +72,8 @@ class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def __init__(
         self,
         adata: AnnData,
-        M: np.array = None,
         n_hidden: Optional[int] = None,
-        n_latent: Optional[int] = None,
+        n_latent: Optional[int] = 10,
         n_layers_encoder: int = 2,
         n_layers_decoder: int = 2,
         dropout_rate: float = 0.1,
@@ -84,19 +83,25 @@ class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "both",
         latent_distribution: Literal["normal", "ln"] = "normal",
         deeply_inject_covariates: bool = False,
+        # SCVI Missing Parameters
+        n_layers: int = 1,
+        dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
+        gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
+        n_genes = 0,
+        n_regions = 0,
         **model_kwargs,
     ):
-        super(TFVI, self).__init__(adata)
+        super(SCPEAKVITHREE, self).__init__(adata)
 
         n_cats_per_cov = (
             self.scvi_setup_dict_["extra_categoricals"]["n_cats_per_key"]
             if "extra_categoricals" in self.scvi_setup_dict_
-            else []
-        )
+            else [])
 
-        self.module = TFVAE(
-            n_input_regions=self.summary_stats["n_vars"],
-            m = M,
+        # TODO CALL MODULE CORRECTlY
+        self.module = SCPEAKVAETHREE(
+            # PEAKVI INPUTS
+            n_input_regions=n_regions,
             n_batch=self.summary_stats["n_batch"],
             n_hidden=n_hidden,
             n_latent=n_latent,
@@ -111,13 +116,30 @@ class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             use_layer_norm=use_layer_norm,
             latent_distribution=latent_distribution,
             deeply_inject_covariates=deeply_inject_covariates,
+            # SCVI INPUTS
+            n_input=n_genes,
+            dispersion=dispersion,
+            gene_likelihood=gene_likelihood,
             **model_kwargs,
         )
         self._model_summary_string = (
-            "TFVI Model with params: \nn_hidden: {}, n_latent: {}, n_layers_encoder: {}, "
-            "n_layers_decoder: {} , dropout_rate: {}, latent_distribution: {}, deep injection: {}"
-        ).format(self.module.n_hidden, self.module.n_latent, n_layers_encoder, n_layers_decoder,
-            dropout_rate, latent_distribution, deeply_inject_covariates)
+            "SCPeakVI Model with INPUTS: n_genes:{}, n_regions:{}\n"
+            "PEAKVI PARAMS: n_hidden: {}, n_latent: {}, n_layers_encoder: {}, "
+            "n_layers_decoder: {} , dropout_rate: {}, latent_distribution: {}, deep injection: {}\n"
+            "SCVI PARAMS: dispersion: {}, gene_likelihood: {}"
+        ).format(
+            n_genes,
+            n_regions,
+            self.module.n_hidden,
+            self.module.n_latent,
+            n_layers_encoder,
+            n_layers_decoder,
+            dropout_rate,
+            latent_distribution,
+            deeply_inject_covariates,
+            dispersion,
+            gene_likelihood,)
+
         self.n_latent = n_latent
         self.init_params_ = self._get_init_params(locals())
 
@@ -217,15 +239,15 @@ class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         )
 
     @torch.no_grad()
-    def get_chi_latent_representation(
+    def get_latents(
         self,
         adata: Optional[AnnData] = None,
         indices: Optional[Sequence[int]] = None,
         give_mean: bool = True,
         mc_samples: int = 5000,
         batch_size: Optional[int] = None,
-    ) -> np.ndarray:
-        """
+    ) -> list:
+        r"""
         Return the latent representation for each cell.
 
         This is denoted as :math:`z_n` in our manuscripts.
@@ -258,6 +280,8 @@ class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             adata=adata, indices=indices, batch_size=batch_size
         )
         latent = []
+        latenta = []
+        latentr = []
         for tensors in scdl:
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
@@ -265,14 +289,33 @@ class TFVI(ArchesMixin, VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
             qz_v = outputs["qz_v"]
             z = outputs["z"]
 
+            qza_m = outputs["qza_m"]
+            qza_v = outputs["qza_v"]
+            za = outputs["za"]
+
+            qzr_m = outputs["qzr_m"]
+            qzr_v = outputs["qzr_v"]
+            zr = outputs["zr"]
+
             if give_mean:
                 # does each model need to have this latent distribution param?
                 if self.module.latent_distribution == "ln":
                     samples = Normal(qz_m, qz_v.sqrt()).sample([mc_samples])
                     z = torch.nn.functional.softmax(samples, dim=-1)
                     z = z.mean(dim=0)
+                    samples = Normal(qza_m, qza_v.sqrt()).sample([mc_samples])
+                    za = torch.nn.functional.softmax(samples, dim=-1)
+                    za = za.mean(dim=0)
+                    samples = Normal(qzr_m, qzr_v.sqrt()).sample([mc_samples])
+                    zr = torch.nn.functional.softmax(samples, dim=-1)
+                    zr = zr.mean(dim=0)
                 else:
                     z = qz_m
+                    za = qza_m
+                    zr = qzr_m
 
             latent += [z.cpu()]
-        return torch.cat(latent).numpy()
+            latenta += [za.cpu()]
+            latentr += [zr.cpu()]
+
+        return [torch.cat(latenta).numpy(), torch.cat(latentr).numpy(), torch.cat(latent).numpy()]

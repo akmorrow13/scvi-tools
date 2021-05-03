@@ -255,7 +255,7 @@ class TFVAE(BaseModuleClass):
         # if encode_covariates is False, cat_list to init encoder is None, so
         # batch_index is not used (or categorical_input, but it's empty)
         #       CELLS
-        qz_c_m, qz_c_v, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
+        qz_m, qz_v, z = self.z_encoder(encoder_input, batch_index, *categorical_input)
         d = (self.d_encoder(encoder_input, batch_index, *categorical_input)
              if self.model_depth
              else 1)
@@ -266,10 +266,10 @@ class TFVAE(BaseModuleClass):
              else 1)
 
         if n_samples > 1:
-            qz_c_m = qz_c_m.unsqueeze(0).expand((n_samples, qz_c_m.size(0), qz_c_m.size(1)))
-            qz_c_v = qz_c_v.unsqueeze(0).expand((n_samples, qz_c_v.size(0), qz_c_v.size(1)))
+            qz_m = qz_m.unsqueeze(0).expand((n_samples, qz_m.size(0), qz_m.size(1)))
+            qz_v = qz_v.unsqueeze(0).expand((n_samples, qz_v.size(0), qz_v.size(1)))
             # when z is normal, untran_z == z
-            untran_z = Normal(qz_c_m, qz_c_v.sqrt()).sample()
+            untran_z = Normal(qz_m, qz_v.sqrt()).sample()
             z = self.z_encoder.z_transformation(untran_z)
 
             qz_chi_m = qz_chi_m.unsqueeze(0).expand((n_samples, qz_chi_m.size(0), qz_chi_m.size(1)))
@@ -278,11 +278,11 @@ class TFVAE(BaseModuleClass):
             untran_chi = Normal(qz_chi_m, qz_chi_v.sqrt()).sample()
             chi = self.chi_encoder.z_transformation(untran_chi)
 
-        return dict(d=d, qz_c_m=qz_c_m, qz_c_v=qz_c_v, z=z, h=h, qz_chi_m=qz_chi_m, qz_chi_v=qz_chi_v, chi=chi)
+        return dict(d=d, qz_m=qz_m, qz_v=qz_v, z=z, h=h, qz_chi_m=qz_chi_m, qz_chi_v=qz_chi_v, chi=chi)
 
     def _get_generative_input(self, tensors, inference_outputs, transform_batch=None):
         z = inference_outputs["z"]
-        qz_m = inference_outputs["qz_c_m"]
+        qz_m = inference_outputs["qz_m"]
         chi = inference_outputs["chi"]
         qchi_m = inference_outputs["qz_chi_m"]
         batch_index = tensors[_CONSTANTS.BATCH_KEY]
@@ -345,8 +345,8 @@ class TFVAE(BaseModuleClass):
     ):
         # Getting Tensor Information
         x = tensors[_CONSTANTS.X_KEY]
-        qz_c_m = inference_outputs["qz_c_m"]
-        qz_c_v = inference_outputs["qz_c_v"]
+        qz_m = inference_outputs["qz_m"]
+        qz_v = inference_outputs["qz_v"]
         d = inference_outputs["d"]
         p = generative_outputs["p"]
 
@@ -357,7 +357,7 @@ class TFVAE(BaseModuleClass):
         lamb = generative_outputs["lamb"]
 
         # Computing Elbo Terms
-        kl_cells = kl(Normal(qz_c_m, torch.sqrt(qz_c_v)), Normal(0, 1)).sum(dim=1)
+        kl_cells = kl(Normal(qz_m, torch.sqrt(qz_v)), Normal(0, 1)).sum(dim=1)
         kl_tfs = kl(Normal(qz_chi_m, torch.sqrt(qz_chi_v)), Normal(0, 1)).sum(dim=1)
 
         f = torch.sigmoid(self.region_factors) if self.region_factors is not None else 1
