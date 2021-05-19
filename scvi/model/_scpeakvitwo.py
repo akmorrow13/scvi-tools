@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import torch
 from anndata import AnnData
-from scipy.sparse import csr_matrix, vstack
+from scipy.sparse import coo_matrix, csr_matrix, vstack
 
 from scvi._compat import Literal
 from scvi._docs import doc_differential_expression
