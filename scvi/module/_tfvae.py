@@ -151,6 +151,11 @@ class TFVAE(BaseModuleClass):
         super().__init__()
 
         self.m = torch.tensor(np.transpose(m)).type(torch.float)
+
+        # correctly set m device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.m = self.m.to(device)
+
         self.n_tfs = m.shape[1]
         self.n_input_regions = n_input_regions
         self.n_hidden = (
